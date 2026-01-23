@@ -18,7 +18,7 @@ while True:
     if access_token:
         try:
             data = get_option_chain(access_token, expiry)
-            spot = data["spotPrice"]
+            spot = data["data"]["underlyingValue"]
 
             signal, strike = find_signal(data, spot)
 
