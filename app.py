@@ -2,7 +2,7 @@ import streamlit as st
 import time
 from dhan_api import get_option_chain
 from logic import find_signal
-from expiry import get_next_weekly_expiry
+from expiry import get_next_nifty_expiry
 
 st.set_page_config(page_title="NIFTY Option Scanner", layout="wide")
 
