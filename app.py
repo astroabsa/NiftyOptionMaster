@@ -9,7 +9,7 @@ st.set_page_config(page_title="NIFTY Option Scanner", layout="wide")
 st.title("📊 NIFTY Weekly Option Scanner")
 
 ACCESS_TOKEN = st.secrets["DHAN_ACCESS_TOKEN"]
-expiry = get_next_weekly_expiry()
+expiry = get_next_nifty_expiry()
 
 st.info(f"Monitoring Expiry: {expiry}")
 
