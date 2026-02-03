@@ -9,7 +9,7 @@ import pytz
 # ---------------------------------------------------------
 # 1. PAGE CONFIG & SESSION
 # ---------------------------------------------------------
-st.set_page_config(page_title="Nifty Gamma Hunter", page_icon="🎯", layout="wide")
+st.set_page_config(page_title="Gamma Hunter (Force Mode)", page_icon="💪", layout="wide")
 IST = pytz.timezone('Asia/Kolkata')
 
 if 'log_df' not in st.session_state:
@@ -20,7 +20,7 @@ if 'hist_data' not in st.session_state:
     st.session_state.hist_data = pd.DataFrame()
 
 # ---------------------------------------------------------
-# 2. CONFIGURATION
+# 2. CONFIGURATION & SIDEBAR
 # ---------------------------------------------------------
 try:
     CLIENT_ID = st.secrets["dhan"]["client_id"]
@@ -31,15 +31,35 @@ except:
 
 dhan = dhanhq(CLIENT_ID, ACCESS_TOKEN)
 
-# --- CONFIG ---
-SPOT_ID = "13"          # NIFTY 50
-SPOT_SEGMENT = "IDX_I"  
+# --- SIDEBAR CONTROLS ---
+st.sidebar.title("⚙️ Configuration")
+
+# 1. Index Selector
+index_choice = st.sidebar.radio("Select Index:", ["NIFTY 50", "FINNIFTY"], horizontal=True)
+
+if index_choice == "NIFTY 50":
+    SPOT_ID = "13"
+    EXPIRY_DAY = 3  # Thursday
+else:
+    SPOT_ID = "25"  # FinNifty ID (Check your specific ID if different)
+    EXPIRY_DAY = 1  # Tuesday
+
+# 2. Date Force-Feeder
+def get_math_expiry(target_weekday):
+    """Calculates next specific weekday (0=Mon, 1=Tue, ... 3=Thu)"""
+    today = datetime.now(IST).date()
+    days_ahead = target_weekday - today.weekday()
+    if days_ahead < 0: days_ahead += 7
+    return today + timedelta(days=days_ahead)
+
+calculated_date = get_math_expiry(EXPIRY_DAY)
+expiry_date = st.sidebar.date_input("Force Expiry Date:", calculated_date)
+st.sidebar.caption(f"Fetching data for: {expiry_date}")
 
 # ---------------------------------------------------------
-# 3. SELF-HEALING DATA FETCHER
+# 3. DATA FETCHING (NO VALIDATION CHECKS)
 # ---------------------------------------------------------
 def fetch_intraday_data():
-    """Fetches Spot Price History."""
     try:
         now = datetime.now(IST)
         from_date = (now - timedelta(days=5)).strftime("%Y-%m-%d")
@@ -47,72 +67,48 @@ def fetch_intraday_data():
         
         resp = dhan.intraday_minute_data(
             security_id=SPOT_ID,
-            exchange_segment=SPOT_SEGMENT,
+            exchange_segment="IDX_I",
             instrument_type="INDEX",
             from_date=from_date,
             to_date=to_date
         )
-        
         if resp['status'] != 'success': return None
-        data = resp['data']
-        if not data: return None
-        
-        df = pd.DataFrame(data)
+        df = pd.DataFrame(resp['data'])
         return df['close'].astype(float)
-    except:
-        return None
+    except: return None
 
-def find_valid_expiry_and_chain():
+def get_option_chain_forced():
     """
-    1. Tries all segments to find a list of dates.
-    2. Tests dates until one returns a valid Option Chain.
+    Forcefully requests Option Chain for the selected date.
+    Tries both segments (IDX_I and NSE_FNO) to handle API quirks.
     """
-    possible_segments = ["NSE_FNO", "IDX_I", "NSE_IDX"]
-    found_dates = []
-
-    # A. Find the Date List
-    for seg in possible_segments:
-        try:
-            resp = dhan.expiry_list(under_security_id=int(SPOT_ID), under_exchange_segment=seg)
-            if resp['status'] == 'success' and resp['data']:
-                raw = list(resp['data']) if isinstance(resp['data'], list) else list(resp['data'].keys())
-                # Filter valid YYYY-MM-DD
-                found_dates = sorted([d for d in raw if str(d).count('-')==2])
-                if found_dates:
-                    break # Stop looking if we found dates
-        except: continue
+    date_str = str(expiry_date)
     
-    if not found_dates:
-        # Emergency Fallback: If API list fails, try manually calculated dates
-        today = datetime.now().date()
-        # Try next 7 days
-        found_dates = [str(today + timedelta(days=i)) for i in range(7)]
+    # Attempt 1: Standard Method (Underlying is IDX_I)
+    try:
+        resp = dhan.option_chain(
+            under_security_id=int(SPOT_ID),
+            under_exchange_segment="IDX_I",
+            expiry=date_str
+        )
+        if resp['status'] == 'success': return resp
+    except: pass
 
-    # B. Test Dates against Option Chain (The "811 Error" Killer)
-    for test_date in found_dates:
-        # Ignore past dates
-        try:
-            if datetime.strptime(str(test_date), "%Y-%m-%d").date() < datetime.now().date():
-                continue
-        except: continue
+    # Attempt 2: Fallback Method (Underlying is NSE_FNO - sometimes required)
+    try:
+        resp = dhan.option_chain(
+            under_security_id=int(SPOT_ID),
+            under_exchange_segment="NSE_FNO",
+            expiry=date_str
+        )
+        if resp['status'] == 'success': return resp
+    except: pass
 
-        try:
-            # Try fetching chain with this date
-            oc_resp = dhan.option_chain(
-                under_security_id=int(SPOT_ID),
-                under_exchange_segment="NSE_FNO", # Chain is ALWAYS NSE_FNO
-                expiry=test_date
-            )
-            
-            if oc_resp['status'] == 'success':
-                # IT WORKS! Return this valid data
-                return test_date, oc_resp
-            
-            # If 811 or Failure, loop to next date...
-        except: continue
+    return None
 
-    return None, None
-
+# ---------------------------------------------------------
+# 4. ANALYSIS LOGIC
+# ---------------------------------------------------------
 def analyze_gamma_levels(oc):
     max_ce_oi = 0
     max_pe_oi = 0
@@ -142,21 +138,18 @@ def calculate_rsi(series, period=14):
     rs = gain / loss
     return 100 - (100 / (1 + rs))
 
-# ---------------------------------------------------------
-# 4. MAIN ANALYSIS
-# ---------------------------------------------------------
 def get_market_analysis():
-    # 1. Update History
+    # 1. History
     if st.session_state.hist_data.empty:
         hist_prices = fetch_intraday_data()
         if hist_prices is not None:
             st.session_state.hist_data = hist_prices
 
-    # 2. Get Valid Chain (Self-Healing)
-    expiry, oc_resp = find_valid_expiry_and_chain()
+    # 2. Option Chain (FORCED)
+    oc_resp = get_option_chain_forced()
     
-    if not expiry or not oc_resp:
-        st.error("❌ Critical: Could not find ANY valid expiry date for NIFTY.")
+    if not oc_resp:
+        st.error(f"❌ Failed to fetch Option Chain for {expiry_date}. Market might be closed or date is invalid.")
         return None
 
     try:
@@ -166,7 +159,9 @@ def get_market_analysis():
         ltp = final_data.get('last_price', 0)
     except: return None
 
-    if ltp == 0: return None
+    if ltp == 0: 
+        st.warning("⚠️ LTP is 0 (Market Closed?)")
+        return None
 
     # Update History
     new_price_series = pd.Series([ltp])
@@ -174,14 +169,15 @@ def get_market_analysis():
     if len(full_price_series) > 500: full_price_series = full_price_series.iloc[-500:]
     st.session_state.hist_data = full_price_series
 
-    # 3. Indicators
+    # Indicators
     ema_5 = full_price_series.ewm(span=5, adjust=False).mean().iloc[-1]
     rsi_series = calculate_rsi(full_price_series)
     rsi = rsi_series.iloc[-1]
 
-    # 4. Gamma & Cycle
+    # Gamma
     res, sup = analyze_gamma_levels(oc)
     
+    # Net OI
     strikes = sorted([(float(k), k) for k in oc.keys()])
     atm_tuple = min(strikes, key=lambda x: abs(x[0] - ltp))
     atm_idx = strikes.index(atm_tuple)
@@ -196,7 +192,7 @@ def get_market_analysis():
     
     net_oi_chg = total_pe_chg - total_ce_chg 
 
-    # 5. Signal Logic
+    # Signal Logic
     buildup = "Neutral"
     price_chg = full_price_series.iloc[-1] - full_price_series.iloc[-2] if len(full_price_series) > 1 else 0
     
@@ -224,7 +220,6 @@ def get_market_analysis():
 
     return {
         "time": datetime.now(IST).strftime("%H:%M:%S"),
-        "expiry": expiry,
         "ltp": ltp,
         "ema": round(ema_5, 2),
         "rsi": round(rsi, 2),
@@ -239,7 +234,7 @@ def get_market_analysis():
 # ---------------------------------------------------------
 # 5. DASHBOARD
 # ---------------------------------------------------------
-st.title("🎯 Nifty Gamma Hunter")
+st.title("💪 Gamma Hunter (Force Mode)")
 
 if st.button("🔄 Refresh Now"):
     st.rerun()
@@ -253,9 +248,6 @@ if data:
     }
     if st.session_state.log_df.empty or st.session_state.log_df.iloc[-1]['Timestamp'] != data['time']:
         st.session_state.log_df = pd.concat([st.session_state.log_df, pd.DataFrame([new_row])], ignore_index=True)
-
-    # Info Bar
-    st.info(f"Using Expiry: **{data['expiry']}**")
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Spot Price", data['ltp'], f"{data['ltp']-data['ema']:.1f} vs EMA")
