@@ -32,17 +32,21 @@ except:
 dhan = dhanhq(CLIENT_ID, ACCESS_TOKEN)
 
 # Constants
-SPOT_ID = "13"          
+SPOT_ID = "13"          # NIFTY 50 (Change to '25' if trading FINNIFTY)
 SPOT_SEGMENT = "IDX_I"  
 
 # ---------------------------------------------------------
-# 3. ROBUST DATE FINDER
+# 3. ROBUST DATE FINDER (TUESDAY LOGIC)
 # ---------------------------------------------------------
-def get_next_thursday():
-    """Calculates the nearest Thursday from today."""
+def get_next_tuesday():
+    """Calculates the nearest Tuesday from today."""
     today = datetime.now(IST).date()
-    days_ahead = 3 - today.weekday() # Thursday is 3
+    # Monday=0, Tuesday=1, Wednesday=2, Thursday=3...
+    target_day = 1 # Target is TUESDAY
+    
+    days_ahead = target_day - today.weekday()
     if days_ahead < 0: days_ahead += 7
+    
     return today + timedelta(days=days_ahead)
 
 # Sidebar Control
@@ -51,21 +55,21 @@ use_auto_expiry = st.sidebar.checkbox("Auto-Fetch Expiry", value=True)
 
 expiry_date = None
 if use_auto_expiry:
-    # Try API first, Fallback to Math
+    # Try API first, Fallback to Math (Tuesday)
     try:
         resp = dhan.expiry_list(under_security_id=int(SPOT_ID), under_exchange_segment="NSE_FNO")
         if resp['status'] == 'success' and resp['data']:
             dates = list(resp['data']) if isinstance(resp['data'], list) else list(resp['data'].keys())
             expiry_date = sorted([d for d in dates if str(d).count('-')==2])[0]
         else:
-            expiry_date = str(get_next_thursday())
-            st.sidebar.warning(f"API Expiry failed. Using Math: {expiry_date}")
+            expiry_date = str(get_next_tuesday())
+            st.sidebar.warning(f"API Expiry failed. Using Math (Tue): {expiry_date}")
     except:
-        expiry_date = str(get_next_thursday())
-        st.sidebar.warning(f"API failed. Defaulting to: {expiry_date}")
+        expiry_date = str(get_next_tuesday())
+        st.sidebar.warning(f"API failed. Defaulting to (Tue): {expiry_date}")
 else:
     # Manual Override
-    expiry_date = str(st.sidebar.date_input("Select Expiry", get_next_thursday()))
+    expiry_date = str(st.sidebar.date_input("Select Expiry", get_next_tuesday()))
 
 st.sidebar.info(f"Target Expiry: **{expiry_date}**")
 
