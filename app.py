@@ -20,7 +20,7 @@ if 'hist_data' not in st.session_state:
     st.session_state.hist_data = pd.DataFrame()
 
 # ---------------------------------------------------------
-# 2. CONFIGURATION & DEBUG MODE
+# 2. CONFIGURATION
 # ---------------------------------------------------------
 try:
     CLIENT_ID = st.secrets["dhan"]["client_id"]
@@ -29,13 +29,14 @@ except:
     st.error("🚨 Secrets not found! Check .streamlit/secrets.toml")
     st.stop()
 
+# Config Constants
 SECURITY_ID = "13"          # NIFTY
 EXCHANGE_SEGMENT = "IDX_I" 
 INSTRUMENT_TYPE = "INDEX"
 dhan = dhanhq(CLIENT_ID, ACCESS_TOKEN)
 
 # ---------------------------------------------------------
-# 3. ADVANCED CALCULATIONS
+# 3. HELPER FUNCTIONS
 # ---------------------------------------------------------
 def calculate_rsi(series, period=14):
     delta = series.diff()
@@ -45,10 +46,12 @@ def calculate_rsi(series, period=14):
     return 100 - (100 / (1 + rs))
 
 def fetch_intraday_data():
-    """Fetches full intraday history for EMA-5 and RSI calculations."""
+    """
+    Fetches full intraday history.
+    USES 'security_id' (Correct for Historical Data endpoint)
+    """
     try:
         now = datetime.now(IST)
-        # Fetch last 5 days to ensure data exists (even on Mondays)
         from_date = (now - timedelta(days=5)).strftime("%Y-%m-%d")
         to_date = now.strftime("%Y-%m-%d")
         
@@ -60,24 +63,17 @@ def fetch_intraday_data():
             to_date=to_date
         )
         
-        if resp['status'] != 'success': 
-            # Silent fail for UI cleanliness, will build live
-            return None
-        
+        if resp['status'] != 'success': return None
         data = resp['data']
         if not data: return None
         
         df = pd.DataFrame(data)
-        # Dhan returns 'close' prices
         return df['close'].astype(float)
     except:
         return None
 
-def analyze_gamma_levels(oc, ltp):
-    """
-    Identifies the 'Magnet' Strikes where Gamma is highest.
-    Returns: Call Wall (Resistance), Put Wall (Support)
-    """
+def analyze_gamma_levels(oc):
+    """Identifies Magnet Strikes."""
     max_ce_oi = 0
     max_pe_oi = 0
     ce_res_strike = 0
@@ -89,12 +85,9 @@ def analyze_gamma_levels(oc, ltp):
             ce_oi = data.get('ce', {}).get('oi', 0)
             pe_oi = data.get('pe', {}).get('oi', 0)
             
-            # Find Major Resistance (Max CE OI)
             if ce_oi > max_ce_oi:
                 max_ce_oi = ce_oi
                 ce_res_strike = strike
-                
-            # Find Major Support (Max PE OI)
             if pe_oi > max_pe_oi:
                 max_pe_oi = pe_oi
                 pe_sup_strike = strike
@@ -103,53 +96,60 @@ def analyze_gamma_levels(oc, ltp):
     return ce_res_strike, pe_sup_strike
 
 def get_market_analysis():
-    # 1. Fetch Price History (One-time or Update)
+    # 1. Update History
     if st.session_state.hist_data.empty:
         hist_prices = fetch_intraday_data()
         if hist_prices is not None:
             st.session_state.hist_data = hist_prices
 
-    # 2. Get Live Option Chain
+    # 2. Get Expiry & Option Chain
+    # USES 'under_security_id' (Correct for Expiry/Option Chain endpoints)
     expiry = None
     try:
-        # Determine Security ID type (int/str) based on previous diagnostics
-        # Usually Expiry List needs INT, Historical needs STR. We handle both.
-        ex_resp = dhan.expiry_list(int(SECURITY_ID), EXCHANGE_SEGMENT)
-        if ex_resp['status'] != 'success': return None
+        ex_resp = dhan.expiry_list(
+            under_security_id=SECURITY_ID, 
+            under_exchange_segment=EXCHANGE_SEGMENT
+        )
+        
+        if ex_resp['status'] != 'success':
+            st.error(f"Expiry Error: {ex_resp}")
+            return None
 
         dates = list(ex_resp['data']) if isinstance(ex_resp['data'], list) else list(ex_resp['data'].keys())
         expiry = sorted([d for d in dates if str(d).count('-')==2])[0]
         
-        oc_resp = dhan.option_chain(int(SECURITY_ID), EXCHANGE_SEGMENT, expiry)
+        oc_resp = dhan.option_chain(
+            under_security_id=SECURITY_ID, 
+            under_exchange_segment=EXCHANGE_SEGMENT,
+            expiry=expiry
+        )
         if oc_resp['status'] != 'success': return None
         
         raw = oc_resp.get('data', {})
         final_data = raw.get('data', raw) if 'data' in raw else raw
         oc = final_data.get('oc', {})
         ltp = final_data.get('last_price', 0)
-    except: return None
+    except Exception as e:
+        st.error(f"Data Fetch Error: {e}")
+        return None
 
     if ltp == 0: return None
 
-    # Update History with Live LTP
+    # Update History Series
     new_price_series = pd.Series([ltp])
     full_price_series = pd.concat([st.session_state.hist_data, new_price_series], ignore_index=True)
-    # Keep last 500 points to keep it fast
     if len(full_price_series) > 500: full_price_series = full_price_series.iloc[-500:]
     st.session_state.hist_data = full_price_series
 
-    # --- 3. CALCULATE INDICATORS ---
-    # EMA-5 (Faster than EMA-9 for scalping)
+    # 3. Indicators
     ema_5 = full_price_series.ewm(span=5, adjust=False).mean().iloc[-1]
-    
-    # RSI-14 (Momentum Strength)
     rsi_series = calculate_rsi(full_price_series)
     rsi = rsi_series.iloc[-1]
 
-    # --- 4. OI BUILDUP & GAMMA ---
-    res, sup = analyze_gamma_levels(oc, ltp)
+    # 4. Gamma & Cycle
+    res, sup = analyze_gamma_levels(oc)
     
-    # Net OI Change (ATM +/- 3 strikes for pure momentum)
+    # Net OI Change (ATM +/- 3)
     strikes = sorted([(float(k), k) for k in oc.keys()])
     atm_tuple = min(strikes, key=lambda x: abs(x[0] - ltp))
     atm_idx = strikes.index(atm_tuple)
@@ -162,10 +162,9 @@ def get_market_analysis():
         total_ce_chg += (d.get('ce', {}).get('oi', 0) - d.get('ce', {}).get('previous_oi', 0))
         total_pe_chg += (d.get('pe', {}).get('oi', 0) - d.get('pe', {}).get('previous_oi', 0))
     
-    net_oi_chg = total_pe_chg - total_ce_chg # Positive = Bullish
+    net_oi_chg = total_pe_chg - total_ce_chg 
 
-    # --- 5. DETERMINE SIGNAL ---
-    # A. Cycle Identification (Price vs OI)
+    # 5. Signal Logic
     buildup = "Neutral"
     price_chg = full_price_series.iloc[-1] - full_price_series.iloc[-2] if len(full_price_series) > 1 else 0
     
@@ -174,27 +173,22 @@ def get_market_analysis():
     elif price_chg < 0 and net_oi_chg < 0: buildup = "Short Buildup (Strong) 🐻"
     elif price_chg < 0 and net_oi_chg > 0: buildup = "Long Unwinding (Weak) 📉"
 
-    # B. The Signal
     signal = "WAIT"
     color = "gray"
     
-    # Bullish Logic: Price > EMA-5 + RSI > 55 + Bullish Cycle
     if ltp > ema_5 and rsi > 55 and "Long" in buildup:
         signal = "SCALP BUY 🚀"
         color = "green"
     elif ltp > ema_5 and "Short Covering" in buildup:
-        signal = "BUY (Caution: Covering)"
+        signal = "BUY (Caution)"
         color = "lightgreen"
-        
-    # Bearish Logic: Price < EMA-5 + RSI < 45 + Bearish Cycle
     elif ltp < ema_5 and rsi < 45 and "Short" in buildup:
         signal = "SCALP SELL 🩸"
         color = "red"
         
-    # C. Gamma Warning
     gamma_msg = "Safe Zone"
-    if abs(ltp - res) < 20: gamma_msg = f"⚠️ Near Call Wall ({res}). Possible Reversal or Blast."
-    if abs(ltp - sup) < 20: gamma_msg = f"⚠️ Near Put Wall ({sup}). Possible Reversal or Blast."
+    if abs(ltp - res) < 20: gamma_msg = f"⚠️ Near Call Wall ({res})"
+    if abs(ltp - sup) < 20: gamma_msg = f"⚠️ Near Put Wall ({sup})"
 
     return {
         "time": datetime.now(IST).strftime("%H:%M:%S"),
@@ -210,18 +204,17 @@ def get_market_analysis():
     }
 
 # ---------------------------------------------------------
-# 4. UI
+# 4. UI RENDER
 # ---------------------------------------------------------
-st.title("🎯 Nifty Gamma Hunter (EMA-5 + RSI + Buildup)")
+st.title("🎯 Nifty Gamma Hunter")
 
-# Refresh Button
 if st.button("🔄 Refresh Now"):
     st.rerun()
 
 data = get_market_analysis()
 
 if data:
-    # Log Data
+    # Log
     new_row = {
         "Timestamp": data['time'], "Spot": data['ltp'], "EMA_5": data['ema'],
         "RSI": data['rsi'], "Buildup": data['buildup'], "Signal": data['signal']
@@ -229,32 +222,32 @@ if data:
     if st.session_state.log_df.empty or st.session_state.log_df.iloc[-1]['Timestamp'] != data['time']:
         st.session_state.log_df = pd.concat([st.session_state.log_df, pd.DataFrame([new_row])], ignore_index=True)
 
-    # Top Metrics
+    # Metrics
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Spot Price", data['ltp'], f"{data['ltp']-data['ema']:.1f} vs EMA-5")
-    c2.metric("RSI (Momentum)", data['rsi'])
-    c3.metric("Resistance (Max CE)", data['res'])
-    c4.metric("Support (Max PE)", data['sup'])
+    c1.metric("Spot Price", data['ltp'], f"{data['ltp']-data['ema']:.1f} vs EMA")
+    c2.metric("RSI", data['rsi'])
+    c3.metric("Res (Call Wall)", data['res'])
+    c4.metric("Sup (Put Wall)", data['sup'])
 
-    # Main Signal
+    # Signal
     st.markdown(f"""
     <div style="padding: 20px; background: #262730; border-radius: 10px; border: 2px solid {data['color']}; text-align: center;">
         <h1 style="color: {data['color']}; margin:0;">{data['signal']}</h1>
         <h3 style="color: white; margin:5px;">{data['buildup']}</h3>
-        <p style="color: yellow;">{data['gamma']}</p>
+        <p style="color: yellow; font-weight: bold;">{data['gamma']}</p>
     </div>
     """, unsafe_allow_html=True)
 
-    # Table & Download
-    with st.expander("📜 View Data Logs", expanded=True):
+    # Table
+    with st.expander("📜 Logs", expanded=True):
         st.dataframe(st.session_state.log_df.sort_index(ascending=False), use_container_width=True)
     
     csv = st.session_state.log_df.to_csv(index=False).encode('utf-8')
     st.download_button("📥 Download Log", csv, "gamma_log.csv")
 
-# Auto-Refresh Countdown
+# Auto-Refresh
 st.divider()
-st.caption("Auto-refreshing in 180s...")
+st.caption("Next update in 180s...")
 progress_bar = st.progress(0)
 for i in range(180):
     time.sleep(1)
