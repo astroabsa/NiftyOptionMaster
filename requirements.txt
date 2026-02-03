@@ -2,3 +2,4 @@ streamlit
 dhanhq
 pandas
 numpy
+pytz
