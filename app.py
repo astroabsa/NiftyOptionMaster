@@ -20,7 +20,7 @@ if 'hist_data' not in st.session_state:
     st.session_state.hist_data = pd.DataFrame()
 
 # ---------------------------------------------------------
-# 2. CONFIGURATION & SIDEBAR
+# 2. CONFIGURATION
 # ---------------------------------------------------------
 try:
     CLIENT_ID = st.secrets["dhan"]["client_id"]
@@ -31,59 +31,15 @@ except:
 
 dhan = dhanhq(CLIENT_ID, ACCESS_TOKEN)
 
-# Constants
-SPOT_ID = "13"          # NIFTY 50 (Change to '25' if trading FINNIFTY)
+# --- CONFIG ---
+SPOT_ID = "13"          # NIFTY 50
 SPOT_SEGMENT = "IDX_I"  
 
 # ---------------------------------------------------------
-# 3. ROBUST DATE FINDER (TUESDAY LOGIC)
+# 3. SELF-HEALING DATA FETCHER
 # ---------------------------------------------------------
-def get_next_tuesday():
-    """Calculates the nearest Tuesday from today."""
-    today = datetime.now(IST).date()
-    # Monday=0, Tuesday=1, Wednesday=2, Thursday=3...
-    target_day = 1 # Target is TUESDAY
-    
-    days_ahead = target_day - today.weekday()
-    if days_ahead < 0: days_ahead += 7
-    
-    return today + timedelta(days=days_ahead)
-
-# Sidebar Control
-st.sidebar.title("⚙️ Settings")
-use_auto_expiry = st.sidebar.checkbox("Auto-Fetch Expiry", value=True)
-
-expiry_date = None
-if use_auto_expiry:
-    # Try API first, Fallback to Math (Tuesday)
-    try:
-        resp = dhan.expiry_list(under_security_id=int(SPOT_ID), under_exchange_segment="NSE_FNO")
-        if resp['status'] == 'success' and resp['data']:
-            dates = list(resp['data']) if isinstance(resp['data'], list) else list(resp['data'].keys())
-            expiry_date = sorted([d for d in dates if str(d).count('-')==2])[0]
-        else:
-            expiry_date = str(get_next_tuesday())
-            st.sidebar.warning(f"API Expiry failed. Using Math (Tue): {expiry_date}")
-    except:
-        expiry_date = str(get_next_tuesday())
-        st.sidebar.warning(f"API failed. Defaulting to (Tue): {expiry_date}")
-else:
-    # Manual Override
-    expiry_date = str(st.sidebar.date_input("Select Expiry", get_next_tuesday()))
-
-st.sidebar.info(f"Target Expiry: **{expiry_date}**")
-
-# ---------------------------------------------------------
-# 4. MARKET LOGIC
-# ---------------------------------------------------------
-def calculate_rsi(series, period=14):
-    delta = series.diff()
-    gain = (delta.where(delta > 0, 0)).ewm(alpha=1/period, adjust=False).mean()
-    loss = (-delta.where(delta < 0, 0)).ewm(alpha=1/period, adjust=False).mean()
-    rs = gain / loss
-    return 100 - (100 / (1 + rs))
-
 def fetch_intraday_data():
+    """Fetches Spot Price History."""
     try:
         now = datetime.now(IST)
         from_date = (now - timedelta(days=5)).strftime("%Y-%m-%d")
@@ -105,6 +61,57 @@ def fetch_intraday_data():
         return df['close'].astype(float)
     except:
         return None
+
+def find_valid_expiry_and_chain():
+    """
+    1. Tries all segments to find a list of dates.
+    2. Tests dates until one returns a valid Option Chain.
+    """
+    possible_segments = ["NSE_FNO", "IDX_I", "NSE_IDX"]
+    found_dates = []
+
+    # A. Find the Date List
+    for seg in possible_segments:
+        try:
+            resp = dhan.expiry_list(under_security_id=int(SPOT_ID), under_exchange_segment=seg)
+            if resp['status'] == 'success' and resp['data']:
+                raw = list(resp['data']) if isinstance(resp['data'], list) else list(resp['data'].keys())
+                # Filter valid YYYY-MM-DD
+                found_dates = sorted([d for d in raw if str(d).count('-')==2])
+                if found_dates:
+                    break # Stop looking if we found dates
+        except: continue
+    
+    if not found_dates:
+        # Emergency Fallback: If API list fails, try manually calculated dates
+        today = datetime.now().date()
+        # Try next 7 days
+        found_dates = [str(today + timedelta(days=i)) for i in range(7)]
+
+    # B. Test Dates against Option Chain (The "811 Error" Killer)
+    for test_date in found_dates:
+        # Ignore past dates
+        try:
+            if datetime.strptime(str(test_date), "%Y-%m-%d").date() < datetime.now().date():
+                continue
+        except: continue
+
+        try:
+            # Try fetching chain with this date
+            oc_resp = dhan.option_chain(
+                under_security_id=int(SPOT_ID),
+                under_exchange_segment="NSE_FNO", # Chain is ALWAYS NSE_FNO
+                expiry=test_date
+            )
+            
+            if oc_resp['status'] == 'success':
+                # IT WORKS! Return this valid data
+                return test_date, oc_resp
+            
+            # If 811 or Failure, loop to next date...
+        except: continue
+
+    return None, None
 
 def analyze_gamma_levels(oc):
     max_ce_oi = 0
@@ -128,6 +135,16 @@ def analyze_gamma_levels(oc):
         
     return ce_res_strike, pe_sup_strike
 
+def calculate_rsi(series, period=14):
+    delta = series.diff()
+    gain = (delta.where(delta > 0, 0)).ewm(alpha=1/period, adjust=False).mean()
+    loss = (-delta.where(delta < 0, 0)).ewm(alpha=1/period, adjust=False).mean()
+    rs = gain / loss
+    return 100 - (100 / (1 + rs))
+
+# ---------------------------------------------------------
+# 4. MAIN ANALYSIS
+# ---------------------------------------------------------
 def get_market_analysis():
     # 1. Update History
     if st.session_state.hist_data.empty:
@@ -135,25 +152,19 @@ def get_market_analysis():
         if hist_prices is not None:
             st.session_state.hist_data = hist_prices
 
-    # 2. Get Option Chain (Using the Calculated/Selected Date)
+    # 2. Get Valid Chain (Self-Healing)
+    expiry, oc_resp = find_valid_expiry_and_chain()
+    
+    if not expiry or not oc_resp:
+        st.error("❌ Critical: Could not find ANY valid expiry date for NIFTY.")
+        return None
+
     try:
-        oc_resp = dhan.option_chain(
-            under_security_id=int(SPOT_ID), 
-            under_exchange_segment="NSE_FNO",
-            expiry=expiry_date
-        )
-        
-        if oc_resp['status'] != 'success':
-            st.error(f"Option Chain Error: {oc_resp}")
-            return None
-        
         raw = oc_resp.get('data', {})
         final_data = raw.get('data', raw) if 'data' in raw else raw
         oc = final_data.get('oc', {})
         ltp = final_data.get('last_price', 0)
-    except Exception as e:
-        st.error(f"OC Exception: {e}")
-        return None
+    except: return None
 
     if ltp == 0: return None
 
@@ -213,6 +224,7 @@ def get_market_analysis():
 
     return {
         "time": datetime.now(IST).strftime("%H:%M:%S"),
+        "expiry": expiry,
         "ltp": ltp,
         "ema": round(ema_5, 2),
         "rsi": round(rsi, 2),
@@ -235,7 +247,6 @@ if st.button("🔄 Refresh Now"):
 data = get_market_analysis()
 
 if data:
-    # Log
     new_row = {
         "Timestamp": data['time'], "Spot": data['ltp'], "EMA_5": data['ema'],
         "RSI": data['rsi'], "Buildup": data['buildup'], "Signal": data['signal']
@@ -243,28 +254,28 @@ if data:
     if st.session_state.log_df.empty or st.session_state.log_df.iloc[-1]['Timestamp'] != data['time']:
         st.session_state.log_df = pd.concat([st.session_state.log_df, pd.DataFrame([new_row])], ignore_index=True)
 
-    # Metrics
+    # Info Bar
+    st.info(f"Using Expiry: **{data['expiry']}**")
+
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Spot Price", data['ltp'], f"{data['ltp']-data['ema']:.1f} vs EMA")
     c2.metric("RSI", data['rsi'])
     c3.metric("Call Wall", data['res'])
     c4.metric("Put Wall", data['sup'])
 
-    # Main Signal
     st.markdown(f"""
     <div style="padding: 20px; background: #262730; border-radius: 10px; border: 2px solid {data['color']}; text-align: center;">
         <h1 style="color: {data['color']}; margin:0;">{data['signal']}</h1>
         <h3 style="color: white; margin:5px;">{data['buildup']}</h3>
-        <p style="color: yellow;">{data['gamma']}</p>
+        <p style="color: yellow; font-weight: bold;">{data['gamma']}</p>
     </div>
     """, unsafe_allow_html=True)
 
-    with st.expander("📜 Data Logs", expanded=True):
+    with st.expander("📜 Logs", expanded=True):
         st.dataframe(st.session_state.log_df.sort_index(ascending=False), use_container_width=True)
     
     st.download_button("📥 Download Log", st.session_state.log_df.to_csv(index=False).encode('utf-8'), "gamma_log.csv")
 
-# Auto-Refresh
 st.divider()
 st.caption("Auto-refreshing in 180s...")
 progress_bar = st.progress(0)
