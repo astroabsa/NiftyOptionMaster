@@ -29,11 +29,16 @@ except:
     st.error("🚨 Secrets not found! Check .streamlit/secrets.toml")
     st.stop()
 
-# Config Constants
-SECURITY_ID = "13"          # NIFTY
-EXCHANGE_SEGMENT = "IDX_I" 
-INSTRUMENT_TYPE = "INDEX"
 dhan = dhanhq(CLIENT_ID, ACCESS_TOKEN)
+
+# --- CRITICAL FIX: SEPARATE SEGMENTS ---
+# 1. For Chart/History (We watch the Spot Price)
+SPOT_ID = "13"          
+SPOT_SEGMENT = "IDX_I"  
+
+# 2. For Options/Expiry (We query the F&O Segment)
+# Note: Security ID is usually the same for Underlying, but Segment changes
+FNO_SEGMENT = "NSE_FNO" 
 
 # ---------------------------------------------------------
 # 3. HELPER FUNCTIONS
@@ -47,18 +52,18 @@ def calculate_rsi(series, period=14):
 
 def fetch_intraday_data():
     """
-    Fetches full intraday history.
-    USES 'security_id' (Correct for Historical Data endpoint)
+    Fetches Spot Price History (uses IDX_I).
     """
     try:
         now = datetime.now(IST)
         from_date = (now - timedelta(days=5)).strftime("%Y-%m-%d")
         to_date = now.strftime("%Y-%m-%d")
         
+        # Request Spot Data
         resp = dhan.intraday_minute_data(
-            security_id=SECURITY_ID,
-            exchange_segment=EXCHANGE_SEGMENT,
-            instrument_type=INSTRUMENT_TYPE,
+            security_id=SPOT_ID,
+            exchange_segment=SPOT_SEGMENT,
+            instrument_type="INDEX",
             from_date=from_date,
             to_date=to_date
         )
@@ -103,12 +108,12 @@ def get_market_analysis():
             st.session_state.hist_data = hist_prices
 
     # 2. Get Expiry & Option Chain
-    # USES 'under_security_id' (Correct for Expiry/Option Chain endpoints)
     expiry = None
     try:
+        # --- FIX: Use NSE_FNO for Expiry Check ---
         ex_resp = dhan.expiry_list(
-            under_security_id=SECURITY_ID, 
-            under_exchange_segment=EXCHANGE_SEGMENT
+            under_security_id=int(SPOT_ID), 
+            under_exchange_segment=FNO_SEGMENT  # Changed from IDX_I to NSE_FNO
         )
         
         if ex_resp['status'] != 'success':
@@ -118,9 +123,10 @@ def get_market_analysis():
         dates = list(ex_resp['data']) if isinstance(ex_resp['data'], list) else list(ex_resp['data'].keys())
         expiry = sorted([d for d in dates if str(d).count('-')==2])[0]
         
+        # --- FIX: Use NSE_FNO for Option Chain ---
         oc_resp = dhan.option_chain(
-            under_security_id=SECURITY_ID, 
-            under_exchange_segment=EXCHANGE_SEGMENT,
+            under_security_id=int(SPOT_ID), 
+            under_exchange_segment=FNO_SEGMENT, # Changed from IDX_I to NSE_FNO
             expiry=expiry
         )
         if oc_resp['status'] != 'success': return None
